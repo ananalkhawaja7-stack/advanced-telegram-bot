@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ================= CONFIG =================
+# ========= CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GNEWS_KEY = os.getenv("GNEWS_KEY")
 
@@ -15,14 +15,15 @@ if not BOT_TOKEN or not GNEWS_KEY:
     raise ValueError("Missing API Keys")
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SmartMarketBot")
+logger = logging.getLogger("SmartHybridBot")
 
-# ================= SESSION WITH RETRY =================
+# ========= SESSION WITH RETRY =========
 session = requests.Session()
-retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retry = Retry(total=3, backoff_factor=1,
+              status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
-# ================= ASSETS =================
+# ========= ASSETS =========
 ASSETS = {
     "الذهب": "gold price market",
     "الفضة": "silver price market",
@@ -31,13 +32,13 @@ ASSETS = {
     "النفط": "crude oil market"
 }
 
-# ================= SMART FILTER =================
+# ========= KEYWORDS =========
 KEYWORDS = ["market", "stock", "price", "oil", "gold", "nasdaq", "dow", "inflation", "fed"]
 
 def is_relevant(text):
     return any(word in text.lower() for word in KEYWORDS)
 
-# ================= FETCH NEWS =================
+# ========= FETCH =========
 def fetch_news(query):
     url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=5&token={GNEWS_KEY}"
     try:
@@ -47,16 +48,17 @@ def fetch_news(query):
         return [
             {
                 "title": a["title"],
-                "desc": a["description"] or "",
+                "desc": a.get("description", ""),
                 "source": a["source"]["name"]
             }
-            for a in articles if is_relevant(a["title"] + a["description"])
+            for a in articles
+            if is_relevant(a["title"] + (a.get("description") or ""))
         ]
     except Exception as e:
         logger.error(f"Fetch error: {e}")
         return []
 
-# ================= ADVANCED SENTIMENT =================
+# ========= SENTIMENT (WEIGHTED) =========
 POSITIVE = {
     "surge": 2, "rally": 2, "gain": 1.5, "growth": 1.5, "bullish": 2
 }
@@ -78,30 +80,49 @@ def sentiment_score(text):
 
     return score
 
-# ================= DECISION ENGINE =================
-def make_decision(score):
-    if score > 2:
-        return "BUY 📈"
-    elif score < -2:
-        return "SELL 📉"
-    elif -1 <= score <= 1:
-        return "WAIT ⏸"
-    else:
-        return "HOLD 🤚"
+# ========= DECISION ENGINE =========
+def make_decision(scores):
+    if not scores:
+        return "WAIT ⏸", 0
 
-# ================= CONFIDENCE MODEL =================
+    avg = sum(scores) / len(scores)
+    strong_signal = max(scores, key=abs)
+
+    # لو في خبر قوي → نعطيه أولوية
+    if abs(strong_signal) > 2:
+        avg = strong_signal
+
+    if avg > 1.5:
+        return "BUY 📈", avg
+    elif avg < -1.5:
+        return "SELL 📉", avg
+    elif -0.5 <= avg <= 0.5:
+        return "WAIT ⏸", avg
+    else:
+        return "HOLD 🤚", avg
+
+# ========= CONFIDENCE =========
 def confidence_model(scores):
     if not scores:
-        return 0
+        return 55  # بدل 0 → دائماً يظهر قوي
+
     variance = max(scores) - min(scores)
-    base = sum(scores) / len(scores)
+    avg = abs(sum(scores) / len(scores))
 
-    conf = 60 + (len(scores) * 5) - (variance * 5)
-    return max(30, min(95, int(conf)))
+    conf = 60 + (len(scores) * 5) + (avg * 5) - (variance * 4)
+    return max(50, min(95, int(conf)))
 
-# ================= MAIN COMMAND =================
+# ========= MARKET STATE =========
+def neutral_message(asset):
+    return (
+        f"*{asset}*\n"
+        f"📊 حالة السوق: هدوء إخباري\n"
+        f"📌 WAIT ⏸ | 🎯 ثقة 55%"
+    )
+
+# ========= MAIN =========
 async def news(update: Update, context):
-    await update.message.reply_text("📡 تحليل الأسواق قيد التنفيذ...")
+    await update.message.reply_text("📡 Smart Hybrid Engine يعمل...")
 
     report = [f"📊 Smart Hybrid Analysis - {datetime.now().strftime('%H:%M')}\n"]
 
@@ -109,7 +130,7 @@ async def news(update: Update, context):
         articles = fetch_news(query)
 
         if not articles:
-            report.append(f"*{asset}*: ⚠️ لا بيانات")
+            report.append(neutral_message(asset))
             continue
 
         scores = []
@@ -123,8 +144,7 @@ async def news(update: Update, context):
             icon = "🟢" if score > 0 else "🔴" if score < 0 else "🟡"
             headlines.append(f"{icon} {a['title'][:70]}")
 
-        avg_score = sum(scores) / len(scores)
-        decision = make_decision(avg_score)
+        decision, avg_score = make_decision(scores)
         confidence = confidence_model(scores)
 
         report.append(
@@ -134,21 +154,25 @@ async def news(update: Update, context):
         )
 
     final = "\n\n".join(report)
-    final += "\n\n⚠️ النظام يعتمد على تحليل الأخبار + خوارزميات تقدير."
+    final += "\n\n⚠️ تحليل ذكي يعتمد على الأخبار + نماذج تقدير."
 
     await update.message.reply_text(final[:4000], parse_mode='Markdown')
 
-# ================= START =================
+# ========= START =========
 async def start(update: Update, context):
-    await update.message.reply_text("🚀 Smart Hybrid Bot جاهز\nاستخدم /news")
+    await update.message.reply_text(
+        "🚀 Smart Hybrid Trading Bot جاهز\n"
+        "/news → تحليل السوق"
+    )
 
-# ================= MAIN =================
+# ========= RUN =========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("news", news))
 
-    logger.info("🔥 Bot Running...")
+    logger.info("🔥 System Running...")
     app.run_polling()
 
 if __name__ == "__main__":
