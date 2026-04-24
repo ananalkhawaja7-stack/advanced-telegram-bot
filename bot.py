@@ -202,3 +202,30 @@ def main():
 
 if __name__ == "__main__":
     main()
+# أضف هذا المعالج الجديد (بدلاً من معالج start وحده)
+async def auto_welcome(update: Update, context):
+    """يرسل ترحيباً تلقائياً لأي رسالة نصية (بدون أوامر)"""
+    await update.message.reply_text(
+        "🚀 *مرحباً بك في بوت تحليل الأسواق المالية*\n\n"
+        "الأوامر المتاحة:\n"
+        "/news - تحليل فوري للذهب، الفضة، ناسداك، داو جونز، النفط\n"
+        "/start - عرض هذه الرسالة مرة أخرى\n\n"
+        "_تمتع بتحليلات دقيقة!_",
+        parse_mode='Markdown'
+    )
+
+# ثم في دالة main()، أضف:
+def main():
+    threading.Thread(target=run_web).start()
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # معالج الأوامر
+    app.add_handler(CommandHandler("start", auto_welcome))
+    app.add_handler(CommandHandler("news", news))
+    
+    # معالج النصوص العادية (لأي رسالة يكتبها المستخدم)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_welcome))
+    
+    logger.info("🔥 Running...")
+    app.run_polling()
