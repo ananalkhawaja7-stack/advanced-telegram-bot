@@ -1,7 +1,9 @@
 import os
 import requests
 import logging
+import threading
 from datetime import datetime
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler
 from requests.adapters import HTTPAdapter
@@ -17,7 +19,17 @@ if not BOT_TOKEN or not GNEWS_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SmartHybridBot")
 
-# ========= SESSION WITH RETRY =========
+# ========= FLASK (حل مشكلة Render) =========
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot is running ✅"
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=10000)
+
+# ========= SESSION =========
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=1,
               status_forcelist=[500, 502, 503, 504])
@@ -49,7 +61,6 @@ def fetch_news(query):
             {
                 "title": a["title"],
                 "desc": a.get("description", ""),
-                "source": a["source"]["name"]
             }
             for a in articles
             if is_relevant(a["title"] + (a.get("description") or ""))
@@ -58,7 +69,7 @@ def fetch_news(query):
         logger.error(f"Fetch error: {e}")
         return []
 
-# ========= SENTIMENT (WEIGHTED) =========
+# ========= SENTIMENT =========
 POSITIVE = {
     "surge": 2, "rally": 2, "gain": 1.5, "growth": 1.5, "bullish": 2
 }
@@ -80,7 +91,7 @@ def sentiment_score(text):
 
     return score
 
-# ========= DECISION ENGINE =========
+# ========= DECISION =========
 def make_decision(scores):
     if not scores:
         return "WAIT ⏸", 0
@@ -88,7 +99,6 @@ def make_decision(scores):
     avg = sum(scores) / len(scores)
     strong_signal = max(scores, key=abs)
 
-    # لو في خبر قوي → نعطيه أولوية
     if abs(strong_signal) > 2:
         avg = strong_signal
 
@@ -104,7 +114,7 @@ def make_decision(scores):
 # ========= CONFIDENCE =========
 def confidence_model(scores):
     if not scores:
-        return 55  # بدل 0 → دائماً يظهر قوي
+        return 55
 
     variance = max(scores) - min(scores)
     avg = abs(sum(scores) / len(scores))
@@ -112,7 +122,7 @@ def confidence_model(scores):
     conf = 60 + (len(scores) * 5) + (avg * 5) - (variance * 4)
     return max(50, min(95, int(conf)))
 
-# ========= MARKET STATE =========
+# ========= NEUTRAL =========
 def neutral_message(asset):
     return (
         f"*{asset}*\n"
@@ -120,7 +130,7 @@ def neutral_message(asset):
         f"📌 WAIT ⏸ | 🎯 ثقة 55%"
     )
 
-# ========= MAIN =========
+# ========= COMMAND =========
 async def news(update: Update, context):
     await update.message.reply_text("📡 Smart Hybrid Engine يعمل...")
 
@@ -144,7 +154,7 @@ async def news(update: Update, context):
             icon = "🟢" if score > 0 else "🔴" if score < 0 else "🟡"
             headlines.append(f"{icon} {a['title'][:70]}")
 
-        decision, avg_score = make_decision(scores)
+        decision, _ = make_decision(scores)
         confidence = confidence_model(scores)
 
         report.append(
@@ -160,20 +170,21 @@ async def news(update: Update, context):
 
 # ========= START =========
 async def start(update: Update, context):
-    await update.message.reply_text(
-        "🚀 Smart Hybrid Trading Bot جاهز\n"
-        "/news → تحليل السوق"
-    )
+    await update.message.reply_text("🚀 البوت شغال\n/news للتحليل")
 
-# ========= RUN =========
+# ========= MAIN =========
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # تشغيل Flask (لحل مشكلة Render)
+    threading.Thread(target=run_web).start()
 
+    # تشغيل البوت
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("news", news))
 
-    logger.info("🔥 System Running...")
+    logger.info("🔥 Bot + Web Running...")
     app.run_polling()
 
+# ========= RUN =========
 if __name__ == "__main__":
     main()
