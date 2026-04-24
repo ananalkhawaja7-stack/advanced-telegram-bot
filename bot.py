@@ -1,10 +1,7 @@
 import os
-import json
-import hashlib
+import requests
 import logging
 from datetime import datetime
-from typing import List, Dict, Tuple
-import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler
 
@@ -13,119 +10,125 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GNEWS_KEY = os.getenv("GNEWS_KEY")
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")
+MARKETAUX_KEY = os.getenv("MARKETAUX_KEY")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing")
-if not GNEWS_KEY:
-    raise ValueError("GNEWS_KEY missing")
 
+# قائمة الأصول (يمكن إضافة المزيد)
 ASSETS = {
-    "الذهب": "XAU/USD",
-    "الفضة": "XAG/USD",
+    "الذهب": "GC=F",      # رمز الذهب في ياهو فاينانس
+    "الفضة": "SI=F",
     "ناسداك": "IXIC",
     "داو جونز": "DJI",
-    "النفط": "WTI"
+    "النفط": "CL=F"
 }
 
-REC_FILE = "recommendations.json"
+def fetch_finnhub(asset, symbol):
+    """جلب أخبار من Finnhub (لأسهم محددة)"""
+    if not FINNHUB_KEY:
+        return []
+    # Finnhub يحتاج رموزاً مثل AAPL, MSFT. سنستخدم رموزاً تقريبية
+    symbol_map = {"الذهب": "GC", "الفضة": "SI", "ناسداك": "NDAQ", "داو جونز": "DJI", "النفط": "CL"}
+    fin_symbol = symbol_map.get(asset, "GC")
+    url = f"https://finnhub.io/api/v1/news?symbol={fin_symbol}&token={FINNHUB_KEY}"
+    try:
+        data = requests.get(url, timeout=10).json()
+        if isinstance(data, list):
+            return [{"title": a["headline"], "content": a.get("summary", ""), "source": "Finnhub"} for a in data[:2]]
+    except:
+        pass
+    return []
 
-def load_recommendations():
-    if not os.path.exists(REC_FILE):
-        return {}
-    with open(REC_FILE, 'r') as f:
-        return json.load(f)
-
-def save_recommendations(data):
-    with open(REC_FILE, 'w') as f:
-        json.dump(data, f)
-
-def is_recommended(asset, title):
-    recs = load_recommendations()
-    key = hashlib.md5(f"{asset}|{title}".encode()).hexdigest()
-    return key in recs.get(asset, {})
-
-def mark_recommended(asset, title, decision):
-    recs = load_recommendations()
-    key = hashlib.md5(f"{asset}|{title}".encode()).hexdigest()
-    if asset not in recs:
-        recs[asset] = {}
-    recs[asset][key] = {"title": title, "decision": decision, "time": datetime.now().isoformat()}
-    save_recommendations(recs)
+def fetch_marketaux(asset):
+    """جلب أخبار من Marketaux"""
+    if not MARKETAUX_KEY:
+        return []
+    url = f"https://api.marketaux.com/v1/news/all?symbols={asset}&limit=2&api_token={MARKETAUX_KEY}"
+    try:
+        data = requests.get(url, timeout=10).json()
+        if "data" in data:
+            return [{"title": a["title"], "content": a.get("description", ""), "source": "Marketaux"} for a in data["data"][:2]]
+    except:
+        pass
+    return []
 
 def fetch_gnews(asset, symbol):
-    query = f"{asset} {symbol} stock market"
+    """جلب أخبار من GNews"""
+    if not GNEWS_KEY:
+        return []
+    query = f"{asset} market news"
     url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=2&token={GNEWS_KEY}"
     try:
         data = requests.get(url, timeout=10).json()
-        articles = data.get("articles", [])
-        results = []
-        for art in articles[:2]:
-            results.append({
-                "title": art.get("title", ""),
-                "content": art.get("description", art.get("content", "")),
-                "source": art.get("source", {}).get("name", "GNews"),
-                "published": art.get("publishedAt", "")
-            })
-        return results
-    except Exception as e:
-        logger.error(f"GNews error {asset}: {e}")
-        return []
+        if "articles" in data:
+            return [{"title": a["title"], "content": a.get("description", ""), "source": "GNews"} for a in data["articles"][:2]]
+    except:
+        pass
+    return []
+
+def collect_news(asset, symbol):
+    """جمع الأخبار من جميع المصادر المتاحة"""
+    all_news = []
+    all_news.extend(fetch_gnews(asset, symbol))
+    all_news.extend(fetch_finnhub(asset, symbol))
+    all_news.extend(fetch_marketaux(asset))
+    # إزالة التكرارات البسيطة
+    seen = set()
+    unique = []
+    for n in all_news:
+        key = n["title"][:50].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(n)
+    return unique[:3]  # كحد أقصى 3 أخبار
 
 def analyze_sentiment(title, content):
+    """تحليل بسيط للمشاعر"""
     text = (title + " " + content).lower()
-    pos_words = ["surge","rally","gain","bullish","positive","record","high","growth","profit","up"]
-    neg_words = ["drop","fall","decline","bearish","negative","crash","low","loss","down"]
-    pos = sum(1 for w in pos_words if w in text)
-    neg = sum(1 for w in neg_words if w in text)
+    pos = sum(1 for w in ["surge","rally","gain","bullish","positive","up","growth"] if w in text)
+    neg = sum(1 for w in ["drop","fall","decline","bearish","negative","down","loss"] if w in text)
     total = pos + neg
     if total == 0:
-        return 0.0, "⚖️ محايد"
-    raw = (pos - neg) / total
-    if raw >= 0.4:
-        return raw, "🟢 إيجابي"
-    elif raw <= -0.4:
-        return raw, "🔴 سلبي"
+        return 0, "🟡 محايد"
+    score = (pos - neg) / total
+    if score >= 0.3:
+        return score, "🟢 إيجابي"
+    elif score <= -0.3:
+        return score, "🔴 سلبي"
     else:
-        return raw, "🟡 محايد"
+        return score, "🟡 محايد"
 
 def quant_decision(analyses):
     if not analyses:
-        return "⏸ WAIT", 0.0, "لا أخبار كافية"
-    scores = [a["sentiment_score"] for a in analyses]
-    avg = sum(scores) / len(scores)
-    conf = min(0.95, 0.5 + 0.15 * len(analyses))
+        return "WAIT", 0, "لا أخبار"
+    avg = sum(a["score"] for a in analyses) / len(analyses)
+    conf = min(0.9, 0.5 + 0.1 * len(analyses))
     if avg >= 0.4:
         return "📈 BUY", conf, "إيجابي قوي"
     elif avg <= -0.4:
         return "📉 SELL", conf, "سلبي قوي"
     elif avg >= 0.15:
         return "🤚 HOLD", conf, "إيجابي بسيط"
-    elif avg <= -0.15:
-        return "⏸ WAIT", conf, "سلبي بسيط"
     else:
         return "⏸ WAIT", conf, "بدون إشارة"
 
 async def news(update, context):
-    await update.message.reply_text("📡 جارٍ جلب الأخبار وتحليلها... (15-20 ثانية)")
-    result = [f"📊 *تحليل الأسواق*\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
-    for name, sym in ASSETS.items():
-        articles = fetch_gnews(name, sym)
+    await update.message.reply_text("📡 جارٍ جلب الأخبار من عدة مصادر...")
+    result = [f"📊 تحليل الأسواق\n🕐 {datetime.now().strftime('%H:%M')}\n"]
+    for name, symbol in ASSETS.items():
+        articles = collect_news(name, symbol)
         if not articles:
-            result.append(f"*{name} ({sym})* : ⚠️ لا أخبار حديثة.")
+            result.append(f"*{name}*: ⚠️ لا أخبار حديثة (جميع المصادر).")
             continue
         analyses = []
-        for art in articles:
-            score, label = analyze_sentiment(art["title"], art["content"])
-            analyses.append({"sentiment_score": score, "source": art["source"], "title": art["title"]})
-        unique = [a for a in analyses if not is_recommended(name, a["title"])]
-        if not unique:
-            result.append(f"*{name} ({sym})* : ♻️ مكررة (سبق إرسالها).")
-            continue
-        decision, conf, reason = quant_decision(unique)
-        for a in unique:
-            mark_recommended(name, a["title"], decision)
-        sources = list(set(a["source"] for a in unique))
-        result.append(f"*{name} ({sym})*\n📌 {decision} (ثقة {conf:.0%})\n📝 {reason}\n🗞️ مصادر: {', '.join(sources)}\n🔹 {unique[0]['title'][:80]}...")
+        for a in articles:
+            score, label = analyze_sentiment(a["title"], a["content"])
+            analyses.append({"score": score, "source": a["source"], "title": a["title"]})
+        decision, conf, reason = quant_decision(analyses)
+        sources = list(set(a["source"] for a in analyses))
+        result.append(f"*{name}*\n📌 {decision} (ثقة {conf:.0%})\n📝 {reason}\n🗞️ مصادر: {', '.join(sources)}\n🔹 {analyses[0]['title'][:80]}...")
     final = "\n\n".join(result) + "\n\n⚠️ تحليل آلي، ليس استشارة مالية."
     await update.message.reply_text(final[:4096], parse_mode='Markdown')
 
@@ -136,7 +139,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("news", news))
-    logger.info("✅ Bot running with full features")
+    logger.info("✅ Bot running with multiple sources")
     app.run_polling()
 
 if __name__ == "__main__":
