@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 # ========= CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GNEWS_KEY = os.getenv("GNEWS_KEY")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")  # اختياري
 
 if not BOT_TOKEN or not GNEWS_KEY:
     raise ValueError("Missing API Keys")
@@ -19,12 +20,12 @@ if not BOT_TOKEN or not GNEWS_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SmartHybridBot")
 
-# ========= FLASK (حل مشكلة Render) =========
+# ========= FLASK =========
 web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return "Bot is running ✅"
+    return "Bot Running ✅"
 
 def run_web():
     web_app.run(host="0.0.0.0", port=10000)
@@ -37,70 +38,92 @@ session.mount("https://", HTTPAdapter(max_retries=retry))
 
 # ========= ASSETS =========
 ASSETS = {
-    "الذهب": "gold price market",
-    "الفضة": "silver price market",
-    "ناسداك": "Nasdaq stock market",
-    "داو جونز": "Dow Jones index",
-    "النفط": "crude oil market"
+    "الذهب": "gold inflation FED interest rate",
+    "الفضة": "silver inflation economy",
+    "ناسداك": "US tech stocks Apple Microsoft earnings Nasdaq",
+    "داو جونز": "US economy inflation interest rates Dow Jones",
+    "النفط": "crude oil OPEC supply demand geopolitics"
 }
 
-# ========= KEYWORDS =========
-KEYWORDS = ["market", "stock", "price", "oil", "gold", "nasdaq", "dow", "inflation", "fed"]
+KEYWORDS = [
+    "market","stock","price","oil","gold",
+    "nasdaq","dow","inflation","fed",
+    "interest","economy","earnings","recession"
+]
 
+# ========= FILTER =========
 def is_relevant(text):
-    return any(word in text.lower() for word in KEYWORDS)
+    return any(k in text.lower() for k in KEYWORDS)
 
-# ========= FETCH =========
+# ========= FETCH MULTI SOURCE =========
 def fetch_news(query):
-    url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=5&token={GNEWS_KEY}"
+    results = []
+
+    # --- GNews ---
     try:
-        res = session.get(url, timeout=10)
-        data = res.json()
-        articles = data.get("articles", [])
-        return [
-            {
+        url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=5&token={GNEWS_KEY}"
+        data = session.get(url).json()
+        for a in data.get("articles", []):
+            results.append({
                 "title": a["title"],
                 "desc": a.get("description", ""),
-            }
-            for a in articles
-            if is_relevant(a["title"] + (a.get("description") or ""))
-        ]
-    except Exception as e:
-        logger.error(f"Fetch error: {e}")
-        return []
+                "source": "GNews"
+            })
+    except:
+        pass
+
+    # --- NewsAPI (اختياري) ---
+    if NEWSAPI_KEY:
+        try:
+            url = f"https://newsapi.org/v2/everything?q={query}&language=en&pageSize=5&apiKey={NEWSAPI_KEY}"
+            data = session.get(url).json()
+            for a in data.get("articles", []):
+                results.append({
+                    "title": a["title"],
+                    "desc": a.get("description", ""),
+                    "source": "NewsAPI"
+                })
+        except:
+            pass
+
+    # فلترة + إزالة تكرار
+    seen = set()
+    filtered = []
+
+    for r in results:
+        key = r["title"][:60]
+        if key in seen:
+            continue
+        if not is_relevant(r["title"] + r["desc"]):
+            continue
+        seen.add(key)
+        filtered.append(r)
+
+    return filtered[:4]
 
 # ========= SENTIMENT =========
-POSITIVE = {
-    "surge": 2, "rally": 2, "gain": 1.5, "growth": 1.5, "bullish": 2
-}
-NEGATIVE = {
-    "drop": -2, "fall": -2, "loss": -1.5, "crash": -3, "bearish": -2
-}
+POS = {"surge":2,"rally":2,"gain":1.5,"growth":1.5,"bullish":2}
+NEG = {"drop":-2,"fall":-2,"loss":-1.5,"crash":-3,"bearish":-2}
 
-def sentiment_score(text):
+def sentiment(text):
     score = 0
     text = text.lower()
-
-    for word, weight in POSITIVE.items():
-        if word in text:
-            score += weight
-
-    for word, weight in NEGATIVE.items():
-        if word in text:
-            score += weight
-
+    for w,v in POS.items():
+        if w in text: score += v
+    for w,v in NEG.items():
+        if w in text: score += v
     return score
 
 # ========= DECISION =========
-def make_decision(scores):
+def decision(scores):
     if not scores:
         return "WAIT ⏸", 0
 
-    avg = sum(scores) / len(scores)
-    strong_signal = max(scores, key=abs)
+    avg = sum(scores)/len(scores)
+    strong = max(scores, key=abs)
 
-    if abs(strong_signal) > 2:
-        avg = strong_signal
+    if abs(strong) > 2:
+        avg = strong
 
     if avg > 1.5:
         return "BUY 📈", avg
@@ -112,79 +135,70 @@ def make_decision(scores):
         return "HOLD 🤚", avg
 
 # ========= CONFIDENCE =========
-def confidence_model(scores):
+def confidence(scores):
     if not scores:
         return 55
 
     variance = max(scores) - min(scores)
-    avg = abs(sum(scores) / len(scores))
-
-    conf = 60 + (len(scores) * 5) + (avg * 5) - (variance * 4)
+    avg = abs(sum(scores)/len(scores))
+    conf = 60 + len(scores)*5 + avg*5 - variance*4
     return max(50, min(95, int(conf)))
-
-# ========= NEUTRAL =========
-def neutral_message(asset):
-    return (
-        f"*{asset}*\n"
-        f"📊 حالة السوق: هدوء إخباري\n"
-        f"📌 WAIT ⏸ | 🎯 ثقة 55%"
-    )
 
 # ========= COMMAND =========
 async def news(update: Update, context):
-    await update.message.reply_text("📡 Smart Hybrid Engine يعمل...")
+    await update.message.reply_text("📡 تحليل احترافي جاري...")
 
     report = [f"📊 Smart Hybrid Analysis - {datetime.now().strftime('%H:%M')}\n"]
 
     for asset, query in ASSETS.items():
         articles = fetch_news(query)
 
-        if not articles:
-            report.append(neutral_message(asset))
+        if len(articles) < 2:
+            report.append(
+                f"*{asset}*\n📊 هدوء إخباري\n📌 WAIT ⏸ | 🎯 55%"
+            )
             continue
 
         scores = []
-        headlines = []
+        texts = []
 
         for a in articles:
             text = a["title"] + " " + a["desc"]
-            score = sentiment_score(text)
-            scores.append(score)
+            s = sentiment(text)
+            scores.append(s)
 
-            icon = "🟢" if score > 0 else "🔴" if score < 0 else "🟡"
-            headlines.append(f"{icon} {a['title'][:70]}")
+            icon = "🟢" if s>0 else "🔴" if s<0 else "🟡"
+            texts.append(f"{icon} {a['title'][:70]}")
 
-        decision, _ = make_decision(scores)
-        confidence = confidence_model(scores)
+        dec, _ = decision(scores)
+        conf = confidence(scores)
 
         report.append(
             f"*{asset}*\n"
-            f"📌 {decision} | 🎯 ثقة {confidence}%\n"
-            f"🔹 {headlines[0]}"
+            f"📌 {dec} | 🎯 {conf}%\n"
+            f"🔹 {texts[0]}\n"
+            f"🔹 {texts[1]}"
         )
 
     final = "\n\n".join(report)
-    final += "\n\n⚠️ تحليل ذكي يعتمد على الأخبار + نماذج تقدير."
+    final += "\n\n⚠️ تحليل ذكي متعدد المصادر"
 
     await update.message.reply_text(final[:4000], parse_mode='Markdown')
 
 # ========= START =========
 async def start(update: Update, context):
-    await update.message.reply_text("🚀 البوت شغال\n/news للتحليل")
+    await update.message.reply_text("🚀 البوت الاحترافي جاهز\n/news")
 
 # ========= MAIN =========
 def main():
-    # تشغيل Flask (لحل مشكلة Render)
     threading.Thread(target=run_web).start()
 
-    # تشغيل البوت
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("news", news))
 
-    logger.info("🔥 Bot + Web Running...")
+    logger.info("🔥 Running...")
     app.run_polling()
 
-# ========= RUN =========
 if __name__ == "__main__":
     main()
