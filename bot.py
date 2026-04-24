@@ -1,90 +1,204 @@
-# أضف هذه الاستيرادات في الأعلى
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from textblob import TextBlob
-import sqlite3
-from datetime import datetime, timedelta
+import os
+import requests
+import logging
+import threading
+from datetime import datetime
+from flask import Flask
+from telegram import Update
+from telegram.ext import Application, CommandHandler
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ========= 1. قاعدة بيانات بسيطة (SQLite) =========
-def init_db():
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS recommendations
-                 (id INTEGER PRIMARY KEY, asset TEXT, title TEXT, 
-                  decision TEXT, score REAL, timestamp TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_feedback
-                 (user_id INTEGER, recommendation_id INTEGER, feedback INTEGER)''')
-    conn.commit()
-    conn.close()
+# ========= CONFIG =========
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GNEWS_KEY = os.getenv("GNEWS_KEY")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")  # اختياري
 
-init_db()
+if not BOT_TOKEN or not GNEWS_KEY:
+    raise ValueError("Missing API Keys")
 
-def save_recommendation(asset, title, decision, score):
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO recommendations (asset, title, decision, score, timestamp) VALUES (?, ?, ?, ?, ?)",
-              (asset, title, decision, score, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SmartHybridBot")
 
-# ========= 2. تحليل متقدم للمشاعر (TextBlob) =========
-def advanced_sentiment(text):
-    """تحليل المشاعر مع دعم أفضل للغة الإنجليزية"""
-    blob = TextBlob(text)
-    polarity = blob.sentiment.polarity  # -1 إلى +1
-    subjectivity = blob.sentiment.subjectivity  # 0 إلى 1
-    
-    if polarity > 0.3:
-        sentiment = "🟢 إيجابي قوي"
-        action = "BUY 📈"
-    elif polarity > 0.05:
-        sentiment = "🟡 إيجابي ضعيف"
-        action = "HOLD 🤚"
-    elif polarity < -0.3:
-        sentiment = "🔴 سلبي قوي"
-        action = "SELL 📉"
-    elif polarity < -0.05:
-        sentiment = "🟠 سلبي ضعيف"
-        action = "WAIT ⏸"
+# ========= FLASK =========
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot Running ✅"
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=10000)
+
+# ========= SESSION =========
+session = requests.Session()
+retry = Retry(total=3, backoff_factor=1,
+              status_forcelist=[500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retry))
+
+# ========= ASSETS =========
+ASSETS = {
+    "الذهب": "gold inflation FED interest rate",
+    "الفضة": "silver inflation economy",
+    "ناسداك": "US tech stocks Apple Microsoft earnings Nasdaq",
+    "داو جونز": "US economy inflation interest rates Dow Jones",
+    "النفط": "crude oil OPEC supply demand geopolitics"
+}
+
+KEYWORDS = [
+    "market","stock","price","oil","gold",
+    "nasdaq","dow","inflation","fed",
+    "interest","economy","earnings","recession"
+]
+
+# ========= FILTER =========
+def is_relevant(text):
+    return any(k in text.lower() for k in KEYWORDS)
+
+# ========= FETCH MULTI SOURCE =========
+def fetch_news(query):
+    results = []
+
+    # --- GNews ---
+    try:
+        url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=5&token={GNEWS_KEY}"
+        data = session.get(url).json()
+        for a in data.get("articles", []):
+            results.append({
+                "title": a["title"],
+                "desc": a.get("description", ""),
+                "source": "GNews"
+            })
+    except:
+        pass
+
+    # --- NewsAPI (اختياري) ---
+    if NEWSAPI_KEY:
+        try:
+            url = f"https://newsapi.org/v2/everything?q={query}&language=en&pageSize=5&apiKey={NEWSAPI_KEY}"
+            data = session.get(url).json()
+            for a in data.get("articles", []):
+                results.append({
+                    "title": a["title"],
+                    "desc": a.get("description", ""),
+                    "source": "NewsAPI"
+                })
+        except:
+            pass
+
+    # فلترة + إزالة تكرار
+    seen = set()
+    filtered = []
+
+    for r in results:
+        key = r["title"][:60]
+        if key in seen:
+            continue
+        if not is_relevant(r["title"] + r["desc"]):
+            continue
+        seen.add(key)
+        filtered.append(r)
+
+    return filtered[:4]
+
+# ========= SENTIMENT =========
+POS = {"surge":2,"rally":2,"gain":1.5,"growth":1.5,"bullish":2}
+NEG = {"drop":-2,"fall":-2,"loss":-1.5,"crash":-3,"bearish":-2}
+
+def sentiment(text):
+    score = 0
+    text = text.lower()
+    for w,v in POS.items():
+        if w in text: score += v
+    for w,v in NEG.items():
+        if w in text: score += v
+    return score
+
+# ========= DECISION =========
+def decision(scores):
+    if not scores:
+        return "WAIT ⏸", 0
+
+    avg = sum(scores)/len(scores)
+    strong = max(scores, key=abs)
+
+    if abs(strong) > 2:
+        avg = strong
+
+    if avg > 1.5:
+        return "BUY 📈", avg
+    elif avg < -1.5:
+        return "SELL 📉", avg
+    elif -0.5 <= avg <= 0.5:
+        return "WAIT ⏸", avg
     else:
-        sentiment = "⚪ محايد"
-        action = "WAIT ⏸"
-    
-    return polarity, sentiment, action, subjectivity
+        return "HOLD 🤚", avg
 
-# ========= 3. تحديث تلقائي (Scheduler) =========
-scheduler = AsyncIOScheduler()
+# ========= CONFIDENCE =========
+def confidence(scores):
+    if not scores:
+        return 55
 
-async def auto_analysis(context):
-    """إرسال تحليل تلقائي للمستخدمين النشطين"""
-    # ستحتاج إلى تخزين chat_ids للمستخدمين الذين اشتركوا
-    # هذا مثال مبسط
-    logger.info("🔄 تحديث تلقائي للتحليل...")
+    variance = max(scores) - min(scores)
+    avg = abs(sum(scores)/len(scores))
+    conf = 60 + len(scores)*5 + avg*5 - variance*4
+    return max(50, min(95, int(conf)))
 
-# جدولة التحليل كل ساعة
-scheduler.add_job(auto_analysis, 'interval', hours=1)
+# ========= COMMAND =========
+async def news(update: Update, context):
+    await update.message.reply_text("📡 تحليل احترافي جاري...")
 
-# ========= 4. نظام تقييم المستخدمين (أزرار) =========
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    report = [f"📊 Smart Hybrid Analysis - {datetime.now().strftime('%H:%M')}\n"]
 
-async def news_with_feedback(update: Update, context):
-    await update.message.reply_text("📡 جاري التحليل...")
-    
-    # ... كود التحليل ...
-    
-    # إضافة أزرار التقييم
-    keyboard = [[
-        InlineKeyboardButton("👍 مفيد", callback_data="feedback_up"),
-        InlineKeyboardButton("👎 غير مفيد", callback_data="feedback_down")
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(final, parse_mode='Markdown', reply_markup=reply_markup)
+    for asset, query in ASSETS.items():
+        articles = fetch_news(query)
 
-async def feedback_callback(update: Update, context):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "feedback_up":
-        await query.edit_message_text("شكراً لتقييمك! 🙏")
-    else:
-        await query.edit_message_text("تم تسجيل تقييمك، سنحسن الأداء 📈")
+        if len(articles) < 2:
+            report.append(
+                f"*{asset}*\n📊 هدوء إخباري\n📌 WAIT ⏸ | 🎯 55%"
+            )
+            continue
+
+        scores = []
+        texts = []
+
+        for a in articles:
+            text = a["title"] + " " + a["desc"]
+            s = sentiment(text)
+            scores.append(s)
+
+            icon = "🟢" if s>0 else "🔴" if s<0 else "🟡"
+            texts.append(f"{icon} {a['title'][:70]}")
+
+        dec, _ = decision(scores)
+        conf = confidence(scores)
+
+        report.append(
+            f"*{asset}*\n"
+            f"📌 {dec} | 🎯 {conf}%\n"
+            f"🔹 {texts[0]}\n"
+            f"🔹 {texts[1]}"
+        )
+
+    final = "\n\n".join(report)
+    final += "\n\n⚠️ تحليل ذكي متعدد المصادر"
+
+    await update.message.reply_text(final[:4000], parse_mode='Markdown')
+
+# ========= START =========
+async def start(update: Update, context):
+    await update.message.reply_text("🚀 البوت الاحترافي جاهز\n/news")
+
+# ========= MAIN =========
+def main():
+    threading.Thread(target=run_web).start()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("news", news))
+
+    logger.info("🔥 Running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
